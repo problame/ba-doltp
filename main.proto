@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package rpc;
+
+service Worker {
+    rpc OLTPTPCC(OLTPTPCCRequest) returns (OLTPTPCCResponse);
+}
+
+message OLTPTPCCRequest{
+    bytes config = 1;
+}
+
+message OLTPTPCCResponse {
+    string error = 1;
+    bytes results = 2;
+    bytes OLTPOutput = 3;
+}

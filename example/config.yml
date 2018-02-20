@@ -1,0 +1,26 @@
+---
+# The address of the worker
+worker: "localhost:22345"
+
+# The command to start the MySQL server.
+mysqlcommand: [ "bash", "-c", "sleep 30d" ]
+
+# The command to do performance-profiling while TPC-C is running.
+# Receives a SIGINT after the benchmark has finished.
+perfcommand: [ "bash", "-c", "sleep 30d" ]
+
+# Access credentials to MySQL
+# - dbench waits for this MySQL server to come online before starting the benchmark
+# - the OLTP TPC-C config uses these credentials
+mysql:
+    host: "127.0.0.1"
+    port: 3306
+    user: root
+    password: ""
+    db: "tpcc"
+
+# TPCC parameters
+tpcc:
+    seconds: 5
+    terminals: [ 2,4,6,8,10,12,14,16,18,20 ]
+
