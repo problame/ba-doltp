@@ -95,7 +95,7 @@ func copyFile(dest, src string) (err error) {
 		return err
 	}
 	defer conf.Close()
-	newconf, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0660)
+	newconf, err := os.OpenFile(dest, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0666)
 	if err != nil {
 		return err
 	}
@@ -117,7 +117,7 @@ func doController(cmd *cobra.Command, args []string) error {
 
 	workdir := contrArgs.results
 
-	if err := os.Mkdir(workdir, 0770); err != nil {
+	if err := os.Mkdir(workdir, 0777); err != nil {
 		return err
 	}
 
@@ -183,7 +183,7 @@ func doController(cmd *cobra.Command, args []string) error {
 		log.Printf("Doing Run:\n%s", pretty.Sprint(run))
 
 		od := filepath.Join(workdir, dirname)
-		if err := os.Mkdir(od, 0770); err != nil {
+		if err := os.Mkdir(od, 0777); err != nil {
 			log.Panic(err)
 		}
 
@@ -197,7 +197,7 @@ func doController(cmd *cobra.Command, args []string) error {
 
 		runs = append(runs, run)
 		// save runs after successful run
-		f, err := os.OpenFile(filepath.Join(workdir, "runs.json"), os.O_CREATE|os.O_WRONLY, 0660)
+		f, err := os.OpenFile(filepath.Join(workdir, "runs.json"), os.O_CREATE|os.O_WRONLY, 0666)
 		if err != nil {
 			log.Panic(err)
 		}
@@ -213,59 +213,73 @@ func doController(cmd *cobra.Command, args []string) error {
 
 func (r *Run) Run(ctx context.Context, worker rpc.WorkerClient, log *log.Logger, outdir string) (oltpResults []byte, runHadError bool) {
 
-
-	ctx, cancel := context.WithCancel(ctx)
-
-	env := append(os.Environ(), "OUTDIR")
+	outdirAbs, err := filepath.Abs(outdir)
+	if err != nil {
+		log.Panic(err)
+	}
+	env := append(os.Environ(), fmt.Sprintf("OUTDIR=%s", outdirAbs))
 
 	// own ctx to try cancelling it gracefully
-	mysql := NewAsyncCommand(context.Background(), r.MySQLCommand, env)
+	mysql := NewAsyncCommand(ctx, r.MySQLCommand, env)
 	mysql.Start()
-	log.Printf("wait for MySQL server to come up: %s", r.MySQLAuth.String())
-	for  {
-		log.Print("dialing attempt")
-		db, err := sql.Open("mysql", r.MySQLAuth.String()+"?timeout=1s&readTimeout=1s&writeTimeout=1s")
-		if err != nil {
-			log.Printf("dial error: %s", err)
+	defer func() {
+		log.Print("waiting for mysql to exit")
+		if err := mysql.SignalAndWaitTimeout(syscall.SIGINT, 10*time.Second); err != nil {
+			log.Panic(err)
+		}
+	}()
 
-		} else {
-			err = db.Ping()
-			db.Close()
-			if err == nil {
-				break
+	log.Printf("wait for MySQL server to come up: %s", r.MySQLAuth.String())
+	mysqlReachable := make(chan struct{})
+	go func() {
+		defer close(mysqlReachable)
+		for  {
+			log.Print("dialing attempt")
+			db, err := sql.Open("mysql", r.MySQLAuth.String()+"?timeout=1s&readTimeout=1s&writeTimeout=1s")
+			if err != nil {
+				log.Printf("dial error: %s", err)
 			} else {
-				log.Printf("dial error: %S", err)
+				err = db.Ping()
+				db.Close()
+				if err == nil {
+					return
+				} else {
+					log.Printf("dial error: %s", err)
+				}
+			}
+			select {
+			case <-time.After(1 * time.Second):
+				// retry
+				case <- ctx.Done():
+					return
 			}
 		}
-		select {
-		case <- time.After(1*time.Second):
-			// retry
-		case err := <- mysql.Wait():
-			log.Panicf("mysql exited unexpectedly: %s", err)
-		case <- ctx.Done():
-			log.Print("context cancelled, waiting for mysql")
-			mysql.Signal(syscall.SIGTERM)
-			<-mysql.Wait()
-			log.Panic("context cancelled")
-		}
+	}()
+	select {
+	case err := <-mysql.Wait():
+		log.Panic("mysql exited unexpectedly: %s", err)
+	case <- mysqlReachable:
 	}
 
-	log.Print("mysql available")
-	defer cancel()
-
+	// Write OLTP config
 	var oltpconf bytes.Buffer
 	if err := r.TPCCConfig.Render(&oltpconf); err != nil {
 		log.Panic(err)
 	}
-
 	oltp_config_file := filepath.Join(outdir, "oltp_tpcc.xml")
-	if err := ioutil.WriteFile(oltp_config_file, oltpconf.Bytes(), 0660); err != nil {
+	if err := ioutil.WriteFile(oltp_config_file, oltpconf.Bytes(), 0666); err != nil {
 		log.Panic(err)
 	}
 
 	log.Print("starting perf")
 	perf := NewAsyncCommand(ctx, r.PerfCommand, env)
 	perf.Start()
+	defer func() {
+		log.Print("waiting for perf to exit")
+		if err := perf.SignalAndWaitTimeout(syscall.SIGINT, 10*time.Second); err != nil {
+			log.Panic(err)
+		}
+	}()
 
 	log.Print("starting tpcc")
 	rchan := make(chan *rpc.OLTPTPCCResponse)
@@ -280,8 +294,10 @@ func (r *Run) Run(ctx context.Context, worker rpc.WorkerClient, log *log.Logger,
 
 	log.Print("waiting for tpcc to finish")
 	select {
-	case  <- perf.Wait():
-		log.Panic("perf exited unexpectedly")
+	case err := <- mysql.Wait():
+		log.Panicf("mysql exited unexpectedly: %s", err)
+	case err :=  <- perf.Wait():
+		log.Panicf("perf exited unexpectedly: %s", err)
 	case res := <- rchan:
 		if res.Error != "" {
 			var msg bytes.Buffer
@@ -289,20 +305,15 @@ func (r *Run) Run(ctx context.Context, worker rpc.WorkerClient, log *log.Logger,
 			fmt.Fprintf(&msg, "Error message:\n%s", res.Error)
 			fmt.Fprintf(&msg, "OLTP output:\n%s", res.OLTPOutput)
 			log.Print(msg.String())
-			close(rchan)
 		}
 		resultfile := filepath.Join(outdir, "result.csv")
-		if err := ioutil.WriteFile(resultfile, res.Results, 0660); err != nil {
+		if err := ioutil.WriteFile(resultfile, res.Results, 0666); err != nil {
 			log.Panic("error writing results file: %s", err)
 		}
-		perf.Signal(syscall.SIGINT)
-		mysql.Signal(syscall.SIGTERM)
-		AsyncCommandWaitGroup{[]*AsyncCommand{mysql, perf}}.WaitTimeout(10*time.Second)
 		return res.Results, false
 	}
 
 	log.Panic("implementation error")
-
 	return nil, true
 }
 

@@ -4,45 +4,22 @@ import (
 	"sync"
 	"os/exec"
 	"time"
-	"syscall"
-	"os"
 	"context"
 	"fmt"
 	"bytes"
+	"github.com/pkg/errors"
+	"log"
+	"syscall"
 )
-
-type AsyncCommandWaitGroup struct {
-	commands []*AsyncCommand
-}
-
-func (wg AsyncCommandWaitGroup) WaitTimeout(to time.Duration) {
-	var swg sync.WaitGroup
-	for _, c := range wg.commands {
-		c.WaitGroup(&swg)
-	}
-	ch := make(chan struct{})
-	go func() {
-		swg.Wait()
-		close(ch)
-	}()
-	select {
-	case <- ch:
-		return
-	case <- time.After(to):
-		for _, c := range wg.commands {
-			c.Signal(syscall.SIGKILL)
-		}
-	}
-}
 
 type AsyncCommand struct {
 	mtx sync.Mutex
 	cmd *exec.Cmd
-	sig os.Signal
 	wait chan struct{}
 	waitErr error
 	buf bytes.Buffer
 	exited bool
+	sig syscall.Signal
 }
 
 func NewAsyncCommand(ctx context.Context, cmdline, env []string) *AsyncCommand {
@@ -57,14 +34,15 @@ func NewAsyncCommand(ctx context.Context, cmdline, env []string) *AsyncCommand {
 	return c
 }
 
-func (c *AsyncCommand) Signal(sig os.Signal) {
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
+func (c *AsyncCommand) Signal(sig syscall.Signal) {
 	if c.exited {
+		log.Printf("signalling exited process %s", c.cmd.Args)
 		return
+	} else {
+		log.Printf("signalling process %s with %s", c.cmd.Args, sig)
 	}
-	c.cmd.Process.Signal(sig)
 	c.sig = sig
+	c.cmd.Process.Signal(sig)
 }
 
 func (c *AsyncCommand) Wait() <- chan error {
@@ -76,28 +54,37 @@ func (c *AsyncCommand) Wait() <- chan error {
 	return ch
 }
 
-func (c *AsyncCommand) WaitGroup(wg *sync.WaitGroup) {
-	wg.Add(1)
-	go func() {
-		<-c.wait
-		wg.Done()
-	}()
+func (c *AsyncCommand) SignalAndWaitTimeout(sig syscall.Signal, to time.Duration) error {
+	c.Signal(sig)
+	select {
+	case err := <-c.Wait():
+		return err
+	case <- time.After(to):
+		return errors.New("did not exit after timeout")
+	}
+	panic("impl")
+	return nil
 }
 
 func (c *AsyncCommand) Start() {
 	if err := c.cmd.Start(); err != nil {
 		c.waitErr = err
+		c.exited = true
 		close(c.wait)
 		return
 	}
 	go func() {
 		defer close(c.wait)
 		err := c.cmd.Wait()
-		c.mtx.Lock()
-		defer c.mtx.Unlock()
+		log.Printf("process %s exited", c.cmd.Args)
 		c.exited = true
-		if _, ok := err.(*exec.ExitError); ok {
-			c.waitErr = fmt.Errorf("%s\n%s", err, c.buf.String())
+		if ee, ok := err.(*exec.ExitError); ok {
+			ws := ee.Sys().(syscall.WaitStatus)
+			if ws.Signaled() && ws.Signal() == c.sig {
+				c.waitErr = nil
+			} else {
+				c.waitErr = fmt.Errorf("%s\n%s", err, c.buf.String())
+			}
 		} else {
 			c.waitErr = err
 		}
